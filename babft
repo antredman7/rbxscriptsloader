@@ -1,0 +1,1382 @@
+--[[
+    AutoFarmUI Enhanced - native Roblox GUI, no external libraries.
+    Install as a LocalScript in StarterPlayer > StarterPlayerScripts.
+
+    Notes:
+    * Client-side movement and health changes are for your own game / authorized testing.
+    * True invulnerability and secure game logic must be implemented on the server.
+    * Teleporting between places requires the destination place to permit the player to join.
+]]
+
+local Players = game:GetService("Players")
+local UserInputService = game:GetService("UserInputService")
+local RunService = game:GetService("RunService")
+local TweenService = game:GetService("TweenService")
+local Lighting = game:GetService("Lighting")
+local Stats = game:GetService("Stats")
+local HttpService = game:GetService("HttpService")
+
+local player = Players.LocalPlayer
+local playerGui = player:WaitForChild("PlayerGui")
+local oldGui = playerGui:FindFirstChild("AutoFarmUI")
+if oldGui then oldGui:Destroy() end
+
+-- Configuration
+local ACCENT = Color3.fromRGB(76, 132, 255)
+local ACCENT_DARK = Color3.fromRGB(48, 94, 205)
+local BG = Color3.fromRGB(17, 20, 29)
+local PANEL = Color3.fromRGB(25, 29, 41)
+local PANEL_ALT = Color3.fromRGB(32, 37, 52)
+local TEXT = Color3.fromRGB(239, 242, 250)
+local MUTED = Color3.fromRGB(151, 161, 181)
+local GREEN = Color3.fromRGB(55, 205, 135)
+local RED = Color3.fromRGB(235, 82, 98)
+local savedGravity = workspace.Gravity
+local savedLighting = nil
+local savedFogStart = Lighting.FogStart
+local savedCameraFov = (workspace.CurrentCamera and workspace.CurrentCamera.FieldOfView) or 70
+local savedAtmosphere = nil
+local originalAmbient = Lighting.Ambient
+local originalOutdoorAmbient = Lighting.OutdoorAmbient
+local originalColorShiftTop = Lighting.ColorShift_Top
+local originalColorShiftBottom = Lighting.ColorShift_Bottom
+local originalFogColor = Lighting.FogColor
+local originalFogStartValue = Lighting.FogStart
+local originalFogEndValue = Lighting.FogEnd
+local originalCollisions = {}
+local originalWalkSpeed, originalJumpPower
+local activeConnections = {}
+local keysDown = {}
+local isRunning = false
+local goldFarmRunToken = 0
+local flyActive = false
+local noclipActive = false
+local regenActive = false
+local fullbrightActive = false
+local minimized = false
+local currentTab = "Home"
+local flySpeed = 70
+local walkSpeed = 16
+local jumpPower = 50
+local waypointCFrame = nil
+local savedWaypoints = {}
+local nextWaypointId = 0
+local routePlaybackActive = false
+local awaitingKeybind = false
+local toggleKeyCode = Enum.KeyCode.K
+local currentAccent = Color3.fromRGB(76, 132, 255)
+local fpsValue = 0
+local lastFrameTime = os.clock()
+local boatInfoText = nil
+local boatSpeedText = nil
+local configTextBox = nil
+local setFlightSpeedSlider, setWalkSpeedSlider, setJumpPowerSlider, setFovSlider, setFogSlider
+local refreshWaypointList
+local applyAccent
+local activityEntries = {}
+local activityLogLabel = nil
+local flyAttachment, flyVelocity, flyOrientation
+local destroyed = false
+
+local destinations = {
+    { name = "Route Point 1", cframe = CFrame.new(-43.6134491, 62.1137619, 672.744934, -0.999842644, -0.00183729955, 0.017645346, 0, 0.994622767, 0.103564225, -0.0177407414, 0.103547923, -0.994466245) },
+    { name = "Route Point 2", cframe = CFrame.new(-60.1504707, 97.4659729, 8767.91406, -0.99889338, 0.000705028593, 0.0470264405, 0, 0.999887645, -0.0149902813, -0.047031723, -0.0149736926, -0.998781145) },
+    { name = "Route Point 3", cframe = CFrame.new(-54.331871, -345.398346, 9488.60645, -0.98221302, 0, -0.187770084, 0, 1, 0, -0.187770084, 0, -0.98221302) },
+}
+
+local function track(connection)
+    table.insert(activeConnections, connection)
+    return connection
+end
+
+local function getCharacter()
+    return player.Character
+end
+
+local function getHumanoid(character)
+    character = character or getCharacter()
+    return character and character:FindFirstChildOfClass("Humanoid")
+end
+
+local function getRoot(character)
+    character = character or getCharacter()
+    if not character then return nil end
+    return character:FindFirstChild("HumanoidRootPart") or character:FindFirstChild("Torso")
+end
+
+
+-- Remember a safe starting position before AutoFarm moves the character to the
+-- low final endpoint. This is a fallback if the place has no usable SpawnLocation.
+local initialSafeCFrame = nil
+task.spawn(function()
+    local character = player.Character or player.CharacterAdded:Wait()
+    local root = getRoot(character)
+    while character and character.Parent and not root do
+        task.wait()
+        root = getRoot(character)
+    end
+    if root and root.Position.Y > workspace.FallenPartsDestroyHeight then
+        initialSafeCFrame = root.CFrame
+    end
+end)
+
+local function findSafeRespawnCFrame()
+    local team = player.Team
+    local bestCFrame = nil
+    local bestDistance = math.huge
+
+    -- Prefer a real, enabled Roblox SpawnLocation and respect team-only spawns.
+    for _, instance in ipairs(workspace:GetDescendants()) do
+        if instance:IsA("SpawnLocation") and instance.Enabled
+            and instance.Position.Y > workspace.FallenPartsDestroyHeight + 25 then
+            local teamAllowed = instance.Neutral or (team and instance.TeamColor == team.TeamColor)
+            if teamAllowed then
+                local spawnCFrame = instance.CFrame * CFrame.new(0, instance.Size.Y / 2 + 3, 0)
+                local distance = initialSafeCFrame
+                    and (spawnCFrame.Position - initialSafeCFrame.Position).Magnitude
+                    or 0
+                if not bestCFrame or distance < bestDistance then
+                    bestCFrame = spawnCFrame
+                    bestDistance = distance
+                end
+            end
+        end
+    end
+
+    if bestCFrame then
+        return bestCFrame
+    end
+
+    -- If the game uses a custom spawn system with no SpawnLocation instance,
+    -- return to the character's original safe position. Route Point 1 is the
+    -- last-resort fallback and is above the final endpoint in this route.
+    if initialSafeCFrame then
+        return initialSafeCFrame
+    end
+    return destinations[1].cframe + Vector3.new(0, 5, 0)
+end
+
+local function make(className, properties, parent)
+    local object = Instance.new(className)
+    for key, value in pairs(properties or {}) do
+        object[key] = value
+    end
+    object.Parent = parent
+    return object
+end
+
+local function round(object, radius)
+    make("UICorner", { CornerRadius = UDim.new(0, radius or 10) }, object)
+end
+
+local function stroke(object, color, transparency, thickness)
+    make("UIStroke", {
+        Color = color or Color3.fromRGB(57, 66, 88),
+        Transparency = transparency or 0,
+        Thickness = thickness or 1,
+    }, object)
+end
+
+local function tween(object, duration, properties)
+    local animation = TweenService:Create(object, TweenInfo.new(duration or 0.18, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), properties)
+    animation:Play()
+    return animation
+end
+
+local screenGui = make("ScreenGui", {
+    Name = "AutoFarmUI",
+    ResetOnSpawn = false,
+    IgnoreGuiInset = false,
+    ZIndexBehavior = Enum.ZIndexBehavior.Sibling,
+}, playerGui)
+
+local menu = make("Frame", {
+    Name = "Window",
+    Size = UDim2.fromOffset(820, 620),
+    Position = UDim2.new(0.5, -410, 0.5, -310),
+    BackgroundColor3 = BG,
+    BorderSizePixel = 0,
+    ClipsDescendants = true,
+}, screenGui)
+round(menu, 16)
+stroke(menu, Color3.fromRGB(59, 72, 103), 0.25, 1)
+
+local topbar = make("Frame", {
+    Name = "Topbar",
+    Size = UDim2.new(1, 0, 0, 58),
+    BackgroundColor3 = PANEL,
+    BorderSizePixel = 0,
+}, menu)
+round(topbar, 16)
+make("Frame", {
+    Size = UDim2.new(1, 0, 0, 16), Position = UDim2.new(0, 0, 1, -16),
+    BackgroundColor3 = PANEL, BorderSizePixel = 0,
+}, topbar)
+
+local brandMark = make("Frame", {
+    Size = UDim2.fromOffset(34, 34), Position = UDim2.fromOffset(16, 12),
+    BackgroundColor3 = ACCENT, BorderSizePixel = 0,
+}, topbar)
+round(brandMark, 10)
+make("TextLabel", {
+    Size = UDim2.fromScale(1, 1), BackgroundTransparency = 1,
+    Text = "A", TextColor3 = Color3.new(1, 1, 1), TextSize = 20,
+    Font = Enum.Font.GothamBold,
+}, brandMark)
+
+make("TextLabel", {
+    Name = "Title", Size = UDim2.new(0, 360, 0, 25), Position = UDim2.fromOffset(60, 9),
+    BackgroundTransparency = 1, Text = "AUTOFARM  /  TOOLKIT", TextColor3 = TEXT,
+    TextSize = 16, Font = Enum.Font.GothamBold, TextXAlignment = Enum.TextXAlignment.Left,
+}, topbar)
+make("TextLabel", {
+    Size = UDim2.new(0, 360, 0, 18), Position = UDim2.fromOffset(60, 31),
+    BackgroundTransparency = 1, Text = "Native UI  •  Local testing utilities", TextColor3 = MUTED,
+    TextSize = 11, Font = Enum.Font.Gotham, TextXAlignment = Enum.TextXAlignment.Left,
+}, topbar)
+
+local function topButton(name, text, xOffset, color)
+    local button = make("TextButton", {
+        Name = name, Size = UDim2.fromOffset(30, 30), Position = UDim2.new(1, xOffset, 0, 14),
+        BackgroundColor3 = color, BorderSizePixel = 0, Text = text,
+        TextColor3 = TEXT, TextSize = 17, Font = Enum.Font.GothamBold,
+        AutoButtonColor = false,
+    }, topbar)
+    round(button, 9)
+    button.MouseEnter:Connect(function() tween(button, 0.12, { BackgroundColor3 = ACCENT }) end)
+    button.MouseLeave:Connect(function() tween(button, 0.12, { BackgroundColor3 = color }) end)
+    return button
+end
+local minimizeButton = topButton("Minimize", "−", -78, PANEL_ALT)
+local closeButton = topButton("Close", "×", -40, Color3.fromRGB(120, 47, 61))
+
+local sidebar = make("Frame", {
+    Name = "Sidebar", Size = UDim2.new(0, 174, 1, -58), Position = UDim2.fromOffset(0, 58),
+    BackgroundColor3 = Color3.fromRGB(20, 24, 35), BorderSizePixel = 0,
+}, menu)
+make("TextLabel", {
+    Size = UDim2.new(1, -28, 0, 22), Position = UDim2.fromOffset(14, 16),
+    BackgroundTransparency = 1, Text = "WORKSPACE", TextColor3 = MUTED,
+    TextSize = 10, Font = Enum.Font.GothamBold, TextXAlignment = Enum.TextXAlignment.Left,
+}, sidebar)
+
+local pageHolder = make("Frame", {
+    Name = "PageHolder", Size = UDim2.new(1, -190, 1, -78), Position = UDim2.fromOffset(180, 68),
+    BackgroundTransparency = 1,
+}, menu)
+local pages = {}
+local tabButtons = {}
+
+local function makePage(name)
+    local page = make("ScrollingFrame", {
+        Name = name .. "Page", Size = UDim2.fromScale(1, 1),
+        BackgroundTransparency = 1, BorderSizePixel = 0,
+        ScrollBarThickness = 4, ScrollBarImageColor3 = ACCENT,
+        CanvasSize = UDim2.new(0, 0, 0, 0), AutomaticCanvasSize = Enum.AutomaticSize.Y,
+        Visible = false,
+    }, pageHolder)
+    make("UIListLayout", {
+        Padding = UDim.new(0, 10), SortOrder = Enum.SortOrder.LayoutOrder,
+    }, page)
+    make("UIPadding", { PaddingTop = UDim.new(0, 4), PaddingBottom = UDim.new(0, 10), PaddingRight = UDim.new(0, 8) }, page)
+    pages[name] = page
+    return page
+end
+
+local function selectTab(name)
+    currentTab = name
+    for tabName, page in pairs(pages) do
+        page.Visible = (tabName == name)
+    end
+    for tabName, button in pairs(tabButtons) do
+        local selected = tabName == name
+        tween(button, 0.15, {
+            BackgroundColor3 = selected and Color3.fromRGB(38, 55, 88) or Color3.fromRGB(20, 24, 35),
+            TextColor3 = selected and TEXT or MUTED,
+        })
+        local indicator = button:FindFirstChild("Indicator")
+        if indicator then indicator.Visible = selected end
+    end
+end
+
+local tabInfo = {
+    { name = "Home", icon = "⌂" },
+    { name = "Movement", icon = "↗" },
+    { name = "Routes", icon = "◎" },
+    { name = "Character", icon = "◇" },
+    { name = "Settings", icon = "⚙" },
+    { name = "Diagnostics", icon = "⌁" },
+    { name = "Visuals", icon = "☼" },
+    { name = "Boat Lab", icon = "⚒" },
+    { name = "Profiles", icon = "▤" },
+}
+for index, info in ipairs(tabInfo) do
+    local button = make("TextButton", {
+        Name = info.name .. "Tab", Size = UDim2.new(1, -18, 0, 37),
+        Position = UDim2.fromOffset(9, 44 + (index - 1) * 43),
+        BackgroundColor3 = Color3.fromRGB(20, 24, 35), BorderSizePixel = 0,
+        Text = "   " .. info.icon .. "     " .. info.name,
+        TextColor3 = MUTED, TextSize = 13, Font = Enum.Font.GothamMedium,
+        TextXAlignment = Enum.TextXAlignment.Left, AutoButtonColor = false,
+    }, sidebar)
+    round(button, 9)
+    local indicator = make("Frame", {
+        Name = "Indicator", Size = UDim2.new(0, 3, 0, 22), Position = UDim2.new(0, 0, 0.5, -11),
+        BackgroundColor3 = ACCENT, BorderSizePixel = 0, Visible = false,
+    }, button)
+    round(indicator, 2)
+    button.MouseButton1Click:Connect(function() selectTab(info.name) end)
+    tabButtons[info.name] = button
+    makePage(info.name)
+end
+
+local statusLabel = make("TextLabel", {
+    Name = "Status", Size = UDim2.new(1, -20, 0, 28), Position = UDim2.new(0, 10, 1, -36),
+    BackgroundTransparency = 1, Text = "●  Ready  •  K toggles menu", TextColor3 = GREEN,
+    TextSize = 10, Font = Enum.Font.Gotham, TextXAlignment = Enum.TextXAlignment.Left,
+}, sidebar)
+
+local function notify(message, color)
+    statusLabel.Text = "●  " .. message
+    statusLabel.TextColor3 = color or GREEN
+    table.insert(activityEntries, 1, os.date("%H:%M:%S") .. "  " .. tostring(message))
+    while #activityEntries > 8 do table.remove(activityEntries) end
+    if activityLogLabel then activityLogLabel.Text = table.concat(activityEntries, "\n") end
+end
+
+local function section(page, title, subtitle)
+    local card = make("Frame", {
+        Size = UDim2.new(1, -4, 0, subtitle and 72 or 48),
+        BackgroundColor3 = PANEL, BorderSizePixel = 0,
+    }, page)
+    round(card, 11)
+    make("TextLabel", {
+        Size = UDim2.new(1, -24, 0, 23), Position = UDim2.fromOffset(13, subtitle and 10 or 12),
+        BackgroundTransparency = 1, Text = title, TextColor3 = TEXT,
+        TextSize = 14, Font = Enum.Font.GothamBold, TextXAlignment = Enum.TextXAlignment.Left,
+    }, card)
+    if subtitle then
+        make("TextLabel", {
+            Size = UDim2.new(1, -24, 0, 25), Position = UDim2.fromOffset(13, 35),
+            BackgroundTransparency = 1, Text = subtitle, TextColor3 = MUTED,
+            TextSize = 11, Font = Enum.Font.Gotham, TextWrapped = true,
+            TextXAlignment = Enum.TextXAlignment.Left, TextYAlignment = Enum.TextYAlignment.Top,
+        }, card)
+    end
+    return card
+end
+
+local function actionButton(page, label, description, callback, color)
+    local card = make("TextButton", {
+        Size = UDim2.new(1, -4, 0, description and 58 or 42),
+        BackgroundColor3 = PANEL, BorderSizePixel = 0,
+        Text = "", AutoButtonColor = false,
+    }, page)
+    round(card, 10)
+    local title = make("TextLabel", {
+        Size = UDim2.new(1, -56, 0, 21), Position = UDim2.fromOffset(13, description and 8 or 10),
+        BackgroundTransparency = 1, Text = label, TextColor3 = TEXT,
+        TextSize = 12, Font = Enum.Font.GothamSemibold, TextXAlignment = Enum.TextXAlignment.Left,
+    }, card)
+    if description then
+        make("TextLabel", {
+            Size = UDim2.new(1, -56, 0, 18), Position = UDim2.fromOffset(13, 30),
+            BackgroundTransparency = 1, Text = description, TextColor3 = MUTED,
+            TextSize = 10, Font = Enum.Font.Gotham, TextXAlignment = Enum.TextXAlignment.Left,
+        }, card)
+    end
+    local arrow = make("TextLabel", {
+        Size = UDim2.fromOffset(26, 26), Position = UDim2.new(1, -37, 0.5, -13),
+        BackgroundColor3 = color or PANEL_ALT, Text = "›", TextColor3 = TEXT,
+        TextSize = 20, Font = Enum.Font.GothamBold,
+    }, card)
+    round(arrow, 8)
+    card.MouseEnter:Connect(function() tween(card, 0.12, { BackgroundColor3 = PANEL_ALT }) end)
+    card.MouseLeave:Connect(function() tween(card, 0.12, { BackgroundColor3 = PANEL }) end)
+    card.MouseButton1Click:Connect(callback)
+    return card, title, arrow
+end
+
+local function toggleRow(page, label, description, initial, callback, accent)
+    local card = make("Frame", {
+        Size = UDim2.new(1, -4, 0, description and 64 or 52),
+        BackgroundColor3 = PANEL, BorderSizePixel = 0,
+    }, page)
+    round(card, 10)
+    make("TextLabel", {
+        Size = UDim2.new(1, -90, 0, 21), Position = UDim2.fromOffset(13, description and 9 or 15),
+        BackgroundTransparency = 1, Text = label, TextColor3 = TEXT,
+        TextSize = 12, Font = Enum.Font.GothamSemibold, TextXAlignment = Enum.TextXAlignment.Left,
+    }, card)
+    if description then
+        make("TextLabel", {
+            Size = UDim2.new(1, -90, 0, 18), Position = UDim2.fromOffset(13, 33),
+            BackgroundTransparency = 1, Text = description, TextColor3 = MUTED,
+            TextSize = 10, Font = Enum.Font.Gotham, TextXAlignment = Enum.TextXAlignment.Left,
+        }, card)
+    end
+    local button = make("TextButton", {
+        Size = UDim2.fromOffset(44, 24), Position = UDim2.new(1, -58, 0.5, -12),
+        BackgroundColor3 = initial and (accent or ACCENT) or Color3.fromRGB(62, 69, 86),
+        BorderSizePixel = 0, Text = "", AutoButtonColor = false,
+    }, card)
+    round(button, 12)
+    local knob = make("Frame", {
+        Size = UDim2.fromOffset(18, 18), Position = UDim2.new(0, initial and 23 or 3, 0.5, -9),
+        BackgroundColor3 = Color3.new(1, 1, 1), BorderSizePixel = 0,
+    }, button)
+    round(knob, 10)
+    local state = initial
+    local function paint(animate)
+        local pos = UDim2.new(0, state and 23 or 3, 0.5, -9)
+        local bg = state and (accent or ACCENT) or Color3.fromRGB(62, 69, 86)
+        if animate then
+            tween(knob, 0.15, { Position = pos })
+            tween(button, 0.15, { BackgroundColor3 = bg })
+        else
+            knob.Position = pos
+            button.BackgroundColor3 = bg
+        end
+    end
+    local function setState(newState, skipCallback)
+        state = newState
+        paint(true)
+        if not skipCallback and callback then callback(state) end
+    end
+    button.MouseButton1Click:Connect(function() setState(not state) end)
+    return function(newState, skipCallback) setState(newState, skipCallback) end, function() return state end
+end
+
+local function sliderRow(page, label, minValue, maxValue, initial, callback)
+    local card = make("Frame", { Size = UDim2.new(1, -4, 0, 76), BackgroundColor3 = PANEL, BorderSizePixel = 0 }, page)
+    round(card, 10)
+    local valueLabel = make("TextLabel", {
+        Size = UDim2.new(1, -24, 0, 22), Position = UDim2.fromOffset(13, 9),
+        BackgroundTransparency = 1, Text = label .. ": " .. tostring(initial), TextColor3 = TEXT,
+        TextSize = 12, Font = Enum.Font.GothamSemibold, TextXAlignment = Enum.TextXAlignment.Left,
+    }, card)
+    local trackFrame = make("Frame", {
+        Size = UDim2.new(1, -28, 0, 6), Position = UDim2.fromOffset(14, 49),
+        BackgroundColor3 = Color3.fromRGB(56, 64, 82), BorderSizePixel = 0,
+    }, card)
+    round(trackFrame, 5)
+    local fraction = (initial - minValue) / (maxValue - minValue)
+    local fill = make("Frame", { Size = UDim2.new(fraction, 0, 1, 0), BackgroundColor3 = ACCENT, BorderSizePixel = 0 }, trackFrame)
+    round(fill, 5)
+    local knob = make("TextButton", {
+        Size = UDim2.fromOffset(16, 16), AnchorPoint = Vector2.new(0.5, 0.5),
+        Position = UDim2.new(fraction, 0, 0.5, 0), BackgroundColor3 = Color3.new(1, 1, 1),
+        Text = "", BorderSizePixel = 0, AutoButtonColor = false,
+    }, trackFrame)
+    round(knob, 10)
+    local dragging = false
+    local value = initial
+    local function updateFromX(x)
+        local width = math.max(trackFrame.AbsoluteSize.X, 1)
+        local pct = math.clamp((x - trackFrame.AbsolutePosition.X) / width, 0, 1)
+        value = math.floor(minValue + (maxValue - minValue) * pct + 0.5)
+        fill.Size = UDim2.new(pct, 0, 1, 0)
+        knob.Position = UDim2.new(pct, 0, 0.5, 0)
+        valueLabel.Text = label .. ": " .. tostring(value)
+        callback(value)
+    end
+    knob.InputBegan:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then dragging = true end
+    end)
+    trackFrame.InputBegan:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+            dragging = true
+            updateFromX(input.Position.X)
+        end
+    end)
+    local trackConnection = UserInputService.InputChanged:Connect(function(input)
+        if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch) then updateFromX(input.Position.X) end
+    end)
+    track(trackConnection)
+    local endConnection = UserInputService.InputEnded:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then dragging = false end
+    end)
+    track(endConnection)
+    return function(newValue)
+        value = math.clamp(newValue, minValue, maxValue)
+        local pct = (value - minValue) / (maxValue - minValue)
+        fill.Size = UDim2.new(pct, 0, 1, 0)
+        knob.Position = UDim2.new(pct, 0, 0.5, 0)
+        valueLabel.Text = label .. ": " .. tostring(value)
+        callback(value)
+    end
+end
+
+-- Home page
+local home = pages.Home
+section(home, "Welcome back", "A compact toolkit for your own place and authorized testing.")
+local infoCard = make("Frame", { Size = UDim2.new(1, -4, 0, 90), BackgroundColor3 = PANEL, BorderSizePixel = 0 }, home)
+round(infoCard, 11)
+make("TextLabel", {
+    Size = UDim2.new(1, -24, 0, 22), Position = UDim2.fromOffset(13, 10),
+    BackgroundTransparency = 1, Text = "SESSION STATUS", TextColor3 = MUTED,
+    TextSize = 10, Font = Enum.Font.GothamBold, TextXAlignment = Enum.TextXAlignment.Left,
+}, infoCard)
+local positionLabel = make("TextLabel", {
+    Size = UDim2.new(1, -24, 0, 24), Position = UDim2.fromOffset(13, 34),
+    BackgroundTransparency = 1, Text = "Position: loading...", TextColor3 = TEXT,
+    TextSize = 12, Font = Enum.Font.GothamMedium, TextXAlignment = Enum.TextXAlignment.Left,
+}, infoCard)
+local healthLabel = make("TextLabel", {
+    Size = UDim2.new(1, -24, 0, 20), Position = UDim2.fromOffset(13, 59),
+    BackgroundTransparency = 1, Text = "Health: --", TextColor3 = MUTED,
+    TextSize = 11, Font = Enum.Font.Gotham, TextXAlignment = Enum.TextXAlignment.Left,
+}, infoCard)
+actionButton(home, "Save current position", "Store a temporary waypoint for this session.", function()
+    local root = getRoot()
+    if root then waypointCFrame = root.CFrame; notify("Waypoint saved") else notify("Character not ready", RED) end
+end)
+actionButton(home, "Teleport to saved position", "Return to the waypoint you saved above.", function()
+    local root = getRoot()
+    if root and waypointCFrame then root.CFrame = waypointCFrame; notify("Returned to waypoint") else notify("Save a waypoint first", RED) end
+end)
+actionButton(home, "Respawn character", "Reload your character using Roblox's normal reset flow.", function()
+    local humanoid = getHumanoid()
+    if humanoid then humanoid.Health = 0; notify("Respawning...") else notify("Character not ready", RED) end
+end)
+
+-- Movement page
+local movement = pages.Movement
+section(movement, "Movement controls", "Local movement tools intended for testing your own experience.")
+local setFlyToggle
+setFlyToggle = select(1, toggleRow(movement, "Flight", "Move with WASD, Space to rise, Shift to descend.", false, function(enabled)
+    flyActive = enabled
+    if not enabled then
+        if flyVelocity then flyVelocity:Destroy(); flyVelocity = nil end
+        if flyOrientation then flyOrientation:Destroy(); flyOrientation = nil end
+        if flyAttachment then flyAttachment:Destroy(); flyAttachment = nil end
+    end
+    notify(enabled and "Flight enabled" or "Flight disabled", enabled and GREEN or MUTED)
+end, GREEN))
+setFlightSpeedSlider = sliderRow(movement, "Flight speed", 20, 300, flySpeed, function(value) flySpeed = value end)
+setWalkSpeedSlider = sliderRow(movement, "Walk speed", 8, 100, walkSpeed, function(value)
+    walkSpeed = value
+    local humanoid = getHumanoid()
+    if humanoid then humanoid.WalkSpeed = value end
+end)
+setJumpPowerSlider = sliderRow(movement, "Jump power", 25, 150, jumpPower, function(value)
+    jumpPower = value
+    local humanoid = getHumanoid()
+    if humanoid then humanoid.UseJumpPower = true; humanoid.JumpPower = value end
+end)
+local setNoclipToggle
+setNoclipToggle = select(1, toggleRow(movement, "Noclip", "Disable character collisions while enabled.", false, function(enabled)
+    noclipActive = enabled
+    if not enabled then
+        for part, canCollide in pairs(originalCollisions) do
+            if part and part.Parent then part.CanCollide = canCollide end
+        end
+        table.clear(originalCollisions)
+    end
+    notify(enabled and "Noclip enabled" or "Noclip disabled", enabled and GREEN or MUTED)
+end, Color3.fromRGB(171, 106, 255)))
+
+-- Routes page
+local routes = pages.Routes
+section(routes, "Saved route points", "Gold Farm visits Route Point 1, the middle, Route Point 2, moves 200 studs beyond the final point at Route Point 3's height to clear the last stage, then returns to the saved final endpoint. It repeats until stopped.")
+local goldFarmToggle
+goldFarmToggle = select(1, toggleRow(routes, "Gold Farm / Repeat route", "Repeats Route Point 1 → Middle → Route Point 2 → Last-stage clearance (200 studs forward only) → saved Final endpoint → Route Point 1 at constant travel speed, with no waypoint pauses.", false, function(enabled)
+    goldFarmRunToken += 1
+    local thisRunToken = goldFarmRunToken
+    isRunning = enabled
+
+    local function stillRunning()
+        return isRunning and not destroyed and goldFarmRunToken == thisRunToken
+    end
+
+    if enabled then
+        notify("Gold Farm started: Point 1 → Middle → End of levels → Clearance point → Saved final endpoint", GREEN)
+        task.spawn(function()
+            local ROUTE_SPEED = 375 -- studs per second; keep this constant across all route legs
+            local middleCFrame = destinations[1].cframe:Lerp(destinations[2].cframe, 0.5)
+
+            -- Route Point 3 is far below Route Point 2, so fly across at the
+            -- end-of-level height first and descend only after passing the last stage.
+            -- Extend ONLY the last-stage clearance waypoint 200 studs forward.
+            -- The final endpoint itself stays at the exact saved Route Point 3,
+            -- so the route still finishes at the intended end location.
+            local point2Position = destinations[2].cframe.Position
+            local finalPosition = destinations[3].cframe.Position
+            local forward = Vector3.new(
+                finalPosition.X - point2Position.X,
+                0,
+                finalPosition.Z - point2Position.Z
+            )
+            if forward.Magnitude < 0.001 then
+                forward = Vector3.new(0, 0, 1)
+            else
+                forward = forward.Unit
+            end
+
+            local FINAL_STAGE_FORWARD_OFFSET = 200 -- applied to clearance waypoint only
+            local extendedClearancePosition = finalPosition + forward * FINAL_STAGE_FORWARD_OFFSET
+            local clearanceY = point2Position.Y
+            local finalStageClearanceCFrame = CFrame.new(
+                extendedClearancePosition.X,
+                clearanceY,
+                extendedClearancePosition.Z
+            ) * destinations[3].cframe.Rotation
+
+            local route = {
+                destinations[1],
+                { name = "Middle", cframe = middleCFrame },
+                { name = "End of levels", cframe = destinations[2].cframe },
+                { name = "Last stage clearance", cframe = finalStageClearanceCFrame },
+                { name = "Final endpoint (descend only here)", cframe = destinations[3].cframe },
+            }
+
+            local function waitForRoot()
+                local root = getRoot()
+                while not root and stillRunning() do
+                    RunService.Heartbeat:Wait()
+                    root = getRoot()
+                end
+                if not stillRunning() then return nil end
+                return root
+            end
+
+            local function moveConstantSpeedTo(targetCFrame)
+                local root = waitForRoot()
+                if not root then return false end
+
+                local startCFrame = root.CFrame
+                local distance = (startCFrame.Position - targetCFrame.Position).Magnitude
+                if distance <= 0.01 then
+                    -- Already at this waypoint: immediately advance, with no dwell or hold.
+                    root.CFrame = targetCFrame
+                    return stillRunning()
+                end
+
+                local startTime = os.clock()
+                local duration = distance / ROUTE_SPEED
+                while stillRunning() do
+                    local currentRoot = getRoot()
+                    if not currentRoot then
+                        -- Do not turn AutoFarm off just because the character briefly respawned.
+                        RunService.Heartbeat:Wait()
+                    else
+                        local alpha = math.clamp((os.clock() - startTime) / duration, 0, 1)
+                        -- Linear interpolation gives a constant positional rate per segment.
+                        currentRoot.CFrame = startCFrame:Lerp(targetCFrame, alpha)
+                        if alpha >= 1 then
+                            currentRoot.CFrame = targetCFrame
+                            return true
+                        end
+                        RunService.Heartbeat:Wait()
+                    end
+                end
+                return false
+            end
+
+            local cycleNumber = 0
+            while stillRunning() do
+                cycleNumber += 1
+                for _, destination in ipairs(route) do
+                    if not stillRunning() then break end
+                    notify("Gold Farm moving to " .. destination.name, ACCENT)
+
+                    -- Keep trying this same waypoint while enabled rather than silently
+                    -- disabling the entire route if a character/root part is briefly absent.
+                    local reached = false
+                    while stillRunning() and not reached do
+                        reached = moveConstantSpeedTo(destination.cframe)
+                        if not reached and stillRunning() then
+                            RunService.Heartbeat:Wait()
+                        end
+                    end
+                    if not stillRunning() then break end
+                    notify("Gold Farm reached " .. destination.name .. "; continuing", GREEN)
+
+                    -- After the final endpoint only, wait 10 seconds and reset the
+                    -- character. Then wait for the replacement character before the
+                    -- next cycle starts, so the route does not try to fly a dead rig.
+                    if destination.name == "Final endpoint (descend only here)" then
+                        notify("Final endpoint reached; resetting in 10 seconds", ACCENT)
+                        local resetDeadline = os.clock() + 10
+                        while stillRunning() and os.clock() < resetDeadline do
+                            RunService.Heartbeat:Wait()
+                        end
+
+                        if not stillRunning() then break end
+
+                        local oldCharacter = getCharacter()
+                        local humanoid = getHumanoid(oldCharacter)
+                        local oldRoot = getRoot(oldCharacter)
+                        if humanoid and humanoid.Health > 0 then
+                            -- The final endpoint is below the map. Move to a safe spawn
+                            -- BEFORE killing the humanoid so games that preserve the last
+                            -- position during respawn do not respawn the player underground.
+                            local safeSpawnCFrame = findSafeRespawnCFrame()
+                            if oldRoot then
+                                oldRoot.CFrame = safeSpawnCFrame
+                                oldRoot.AssemblyLinearVelocity = Vector3.zero
+                                oldRoot.AssemblyAngularVelocity = Vector3.zero
+                                humanoid.Sit = false
+                                humanoid.PlatformStand = false
+                                -- Let the spawn-position change replicate before reset.
+                                local settleDeadline = os.clock() + 0.3
+                                while stillRunning() and os.clock() < settleDeadline do
+                                    RunService.Heartbeat:Wait()
+                                end
+                            end
+
+                            if not stillRunning() then break end
+                            humanoid.Health = 0
+                            notify("Resetting from safe spawn; waiting for respawn", ACCENT)
+
+                            while stillRunning() do
+                                local newCharacter = getCharacter()
+                                if newCharacter and newCharacter ~= oldCharacter
+                                    and getRoot(newCharacter) and getHumanoid(newCharacter) then
+                                    break
+                                end
+                                RunService.Heartbeat:Wait()
+                            end
+                        else
+                            notify("Could not reset: character humanoid was not available", RED)
+                        end
+
+                        if not stillRunning() then break end
+                    end
+                    -- No pause at intermediate waypoints; the 10-second wait occurs
+                    -- only after reaching the final endpoint, as requested.
+                end
+
+                if stillRunning() then
+                    notify("Gold Farm cycle " .. tostring(cycleNumber) .. " complete; repeating", GREEN)
+                    -- Immediate next cycle: flies from the final endpoint back to Point 1.
+                end
+                RunService.Heartbeat:Wait()
+            end
+        end)
+    else
+        notify("Gold Farm stopped", MUTED)
+    end
+end, ACCENT))
+local function teleportToCFrame(cf, label)
+    local root = getRoot()
+    if not root then notify("Character not ready", RED); return end
+    root.CFrame = cf
+    root.AssemblyLinearVelocity = Vector3.zero
+    root.AssemblyAngularVelocity = Vector3.zero
+    notify("Moved to " .. label)
+end
+for _, destination in ipairs(destinations) do
+    actionButton(routes, destination.name, "Teleport to the configured CFrame.", function()
+        teleportToCFrame(destination.cframe, destination.name)
+    end, ACCENT_DARK)
+end
+-- Character page
+local characterPage = pages.Character
+section(characterPage, "Character utilities", "Convenience actions and client-side test helpers.")
+local setRegenToggle
+setRegenToggle = select(1, toggleRow(characterPage, "Local health regeneration", "Refill your health locally while your character is alive.", false, function(enabled)
+    regenActive = enabled
+    notify(enabled and "Local regeneration enabled" or "Local regeneration disabled", enabled and GREEN or MUTED)
+end, GREEN))
+actionButton(characterPage, "Heal character", "Restore current humanoid health to its maximum locally.", function()
+    local humanoid = getHumanoid()
+    if humanoid then humanoid.Health = humanoid.MaxHealth; notify("Health restored") else notify("Character not ready", RED) end
+end)
+actionButton(characterPage, "Restore default movement", "Reset WalkSpeed and JumpPower to common defaults.", function()
+    walkSpeed, jumpPower = 16, 50
+    if setWalkSpeedSlider then setWalkSpeedSlider(16) end
+    if setJumpPowerSlider then setJumpPowerSlider(50) end
+    local humanoid = getHumanoid()
+    if humanoid then humanoid.WalkSpeed = walkSpeed; humanoid.UseJumpPower = true; humanoid.JumpPower = jumpPower end
+    notify("Movement defaults restored")
+end)
+actionButton(characterPage, "Clear saved waypoint", "Remove the temporary waypoint stored this session.", function()
+    waypointCFrame = nil
+    notify("Waypoint cleared", MUTED)
+end)
+
+-- Settings page
+local settings = pages.Settings
+local settingsSearch = make("TextBox", { Size = UDim2.new(1, -4, 0, 38), BackgroundColor3 = PANEL, BorderSizePixel = 0, Text = "", PlaceholderText = "Search settings...", PlaceholderColor3 = MUTED, TextColor3 = TEXT, TextSize = 12, Font = Enum.Font.Gotham, ClearTextOnFocus = false }, settings)
+round(settingsSearch, 9)
+settingsSearch:GetPropertyChangedSignal("Text"):Connect(function()
+    local query = string.lower(settingsSearch.Text)
+    for _, item in ipairs(settings:GetChildren()) do
+        if item:IsA("GuiObject") and item ~= settingsSearch then
+            local combined = ""
+            for _, descendant in ipairs(item:GetDescendants()) do
+                if descendant:IsA("TextLabel") or descendant:IsA("TextButton") or descendant:IsA("TextBox") then combined ..= " " .. descendant.Text end
+            end
+            item.Visible = query == "" or string.find(string.lower(combined), query, 1, true) ~= nil
+        end
+    end
+end)
+section(settings, "Interface & environment", "Keyboard shortcuts and optional visual testing settings.")
+actionButton(settings, "Toggle menu visibility", "Shortcut: K. You can also use the minimize button.", function()
+    screenGui.Enabled = not screenGui.Enabled
+end)
+actionButton(settings, "Restore lighting", "Turn off Fullbright and restore saved Lighting values.", function()
+    if savedLighting then
+        Lighting.Brightness = savedLighting.Brightness
+        Lighting.ClockTime = savedLighting.ClockTime
+        Lighting.FogEnd = savedLighting.FogEnd
+        Lighting.GlobalShadows = savedLighting.GlobalShadows
+        Lighting.FogStart = savedFogStart
+        fullbrightActive = false
+        notify("Lighting restored", MUTED)
+    else
+        notify("No saved lighting settings", RED)
+    end
+end)
+local setFullbrightToggle
+setFullbrightToggle = select(1, toggleRow(settings, "Fullbright", "Temporarily brighten the client view for environment testing.", false, function(enabled)
+    fullbrightActive = enabled
+    if enabled then
+        if not savedLighting then
+            savedLighting = {
+                Brightness = Lighting.Brightness,
+                ClockTime = Lighting.ClockTime,
+                FogEnd = Lighting.FogEnd,
+                GlobalShadows = Lighting.GlobalShadows,
+                FogStart = Lighting.FogStart,
+            }
+        end
+        Lighting.Brightness = 3
+        Lighting.ClockTime = 14
+        Lighting.FogEnd = 100000
+        Lighting.GlobalShadows = false
+    elseif savedLighting then
+        Lighting.Brightness = savedLighting.Brightness
+        Lighting.ClockTime = savedLighting.ClockTime
+        Lighting.FogEnd = savedLighting.FogEnd
+        Lighting.GlobalShadows = savedLighting.GlobalShadows
+        Lighting.FogStart = savedLighting.FogStart or savedFogStart
+    end
+    notify(enabled and "Fullbright enabled" or "Fullbright disabled", enabled and GREEN or MUTED)
+end, ACCENT))
+
+-- Additional developer tools: waypoint manager, diagnostics, visuals, boat lab and profiles.
+local diagnostics = pages.Diagnostics
+section(diagnostics, "Live diagnostics", "Client-side readings useful while testing your own experience.")
+local diagCard = make("Frame", { Size = UDim2.new(1, -4, 0, 154), BackgroundColor3 = PANEL, BorderSizePixel = 0 }, diagnostics)
+round(diagCard, 11)
+local function diagnosticLine(text, y)
+    return make("TextLabel", { Size = UDim2.new(1, -24, 0, 22), Position = UDim2.fromOffset(13, y), BackgroundTransparency = 1, Text = text, TextColor3 = TEXT, TextSize = 12, Font = Enum.Font.GothamMedium, TextXAlignment = Enum.TextXAlignment.Left }, diagCard)
+end
+local fpsLabel = diagnosticLine("FPS: --", 10)
+local pingLabel = diagnosticLine("Ping: unavailable", 35)
+local velocityLabel = diagnosticLine("Velocity: --", 60)
+local stateLabel = diagnosticLine("Character state: --", 85)
+local placeLabel = diagnosticLine("Place / Job: --", 110)
+local logCard = make("Frame", { Size = UDim2.new(1, -4, 0, 130), BackgroundColor3 = PANEL, BorderSizePixel = 0 }, diagnostics)
+round(logCard, 11)
+make("TextLabel", { Size = UDim2.new(1, -24, 0, 20), Position = UDim2.fromOffset(12, 8), BackgroundTransparency = 1, Text = "RECENT ACTIVITY", TextColor3 = MUTED, TextSize = 10, Font = Enum.Font.GothamBold, TextXAlignment = Enum.TextXAlignment.Left }, logCard)
+activityLogLabel = make("TextLabel", { Size = UDim2.new(1, -24, 1, -34), Position = UDim2.fromOffset(12, 28), BackgroundTransparency = 1, Text = "Ready", TextColor3 = TEXT, TextSize = 10, Font = Enum.Font.Code, TextWrapped = true, TextXAlignment = Enum.TextXAlignment.Left, TextYAlignment = Enum.TextYAlignment.Top }, logCard)
+
+local visuals = pages.Visuals
+section(visuals, "Visual testing", "Client-side visual adjustments. Use Reset visuals to restore the original values.")
+setFovSlider = sliderRow(visuals, "Camera FOV", 50, 100, savedCameraFov, function(value)
+    local camera = workspace.CurrentCamera
+    if camera then camera.FieldOfView = value end
+end)
+setFogSlider = sliderRow(visuals, "Fog distance", 100, 100000, math.clamp(math.floor(Lighting.FogEnd), 100, 100000), function(value)
+    Lighting.FogEnd = value
+end)
+actionButton(visuals, "Clear fog for testing", "Set fog distance to the maximum slider value.", function()
+    if setFogSlider then setFogSlider(100000) end
+    notify("Fog distance increased")
+end)
+actionButton(visuals, "Reset visuals", "Restore original FOV, fog, ambient lighting and shadows.", function()
+    local camera = workspace.CurrentCamera
+    if camera then camera.FieldOfView = savedCameraFov end
+    Lighting.FogStart = originalFogStartValue
+    Lighting.FogEnd = originalFogEndValue
+    Lighting.FogColor = originalFogColor
+    Lighting.Ambient = originalAmbient
+    Lighting.OutdoorAmbient = originalOutdoorAmbient
+    Lighting.ColorShift_Top = originalColorShiftTop
+    Lighting.ColorShift_Bottom = originalColorShiftBottom
+    if savedLighting then
+        Lighting.Brightness = savedLighting.Brightness
+        Lighting.ClockTime = savedLighting.ClockTime
+        Lighting.GlobalShadows = savedLighting.GlobalShadows
+    end
+    fullbrightActive = false
+    notify("Visual settings restored", MUTED)
+end)
+
+local boatLab = pages["Boat Lab"]
+section(boatLab, "Boat inspection", "Inspects nearby seat-based assemblies. Results depend on your game's boat structure.")
+local boatCard = make("Frame", { Size = UDim2.new(1, -4, 0, 90), BackgroundColor3 = PANEL, BorderSizePixel = 0 }, boatLab)
+round(boatCard, 11)
+boatInfoText = make("TextLabel", { Size = UDim2.new(1, -24, 1, -16), Position = UDim2.fromOffset(12, 8), BackgroundTransparency = 1, Text = "No inspection yet. Click Inspect nearest boat.", TextColor3 = TEXT, TextSize = 12, Font = Enum.Font.Gotham, TextWrapped = true, TextXAlignment = Enum.TextXAlignment.Left, TextYAlignment = Enum.TextYAlignment.Top }, boatCard)
+boatSpeedText = make("TextLabel", { Size = UDim2.new(1, -24, 0, 22), BackgroundTransparency = 1, Text = "Boat speed: --", TextColor3 = MUTED, TextSize = 12, Font = Enum.Font.GothamMedium, TextXAlignment = Enum.TextXAlignment.Left }, boatLab)
+local inspectedBoat = nil
+local function findNearestBoat()
+    local root = getRoot()
+    if not root then return nil end
+    local nearest, nearestDistance = nil, math.huge
+    for _, obj in ipairs(workspace:GetDescendants()) do
+        if obj:IsA("Model") then
+            local seat = obj:FindFirstChildWhichIsA("VehicleSeat", true) or obj:FindFirstChildWhichIsA("Seat", true)
+            if seat then
+                local part = obj.PrimaryPart or seat
+                local distance = (part.Position - root.Position).Magnitude
+                if distance < nearestDistance then nearest, nearestDistance = obj, distance end
+            end
+        end
+    end
+    return nearest, nearestDistance
+end
+actionButton(boatLab, "Inspect nearest boat", "Count parts, seats, welds and report the closest seat-based model.", function()
+    local boat, distance = findNearestBoat()
+    if not boat then boatInfoText.Text = "No nearby model with a Seat or VehicleSeat was found."; notify("No boat found", RED); return end
+    inspectedBoat = boat
+    local parts, seats, welds = 0, 0, 0
+    for _, item in ipairs(boat:GetDescendants()) do
+        if item:IsA("BasePart") then parts += 1 end
+        if item:IsA("Seat") or item:IsA("VehicleSeat") then seats += 1 end
+        if item:IsA("Weld") or item:IsA("WeldConstraint") or item:IsA("Motor6D") or item:IsA("RigidConstraint") then welds += 1 end
+    end
+    boatInfoText.Text = string.format("Model: %s\nDistance: %.1f studs\nParts: %d  •  Seats: %d  •  Joints: %d", boat.Name, distance or 0, parts, seats, welds)
+    notify("Boat inspected: " .. boat.Name)
+end, ACCENT)
+actionButton(boatLab, "Stop inspected boat motion", "Zero assembly velocities locally; server-owned physics may override this.", function()
+    if not inspectedBoat or not inspectedBoat.Parent then notify("Inspect a boat first", RED); return end
+    local count = 0
+    for _, item in ipairs(inspectedBoat:GetDescendants()) do
+        if item:IsA("BasePart") and not item.Anchored then
+            item.AssemblyLinearVelocity = Vector3.zero
+            item.AssemblyAngularVelocity = Vector3.zero
+            count += 1
+        end
+    end
+    notify("Stopped motion on " .. tostring(count) .. " parts")
+end)
+actionButton(boatLab, "Save current position as test checkpoint", "Adds a named waypoint in the route manager.", function()
+    local root = getRoot()
+    if not root then notify("Character not ready", RED); return end
+    nextWaypointId += 1
+    table.insert(savedWaypoints, { id = nextWaypointId, name = "Checkpoint " .. nextWaypointId, cframe = root.CFrame })
+    refreshWaypointList()
+    notify("Checkpoint saved")
+end)
+
+local profiles = pages.Profiles
+section(profiles, "Configuration profiles", "Export/import settings as JSON text. This LocalScript cannot write persistent DataStore data by itself.")
+configTextBox = make("TextBox", { Size = UDim2.new(1, -4, 0, 120), BackgroundColor3 = PANEL, BorderSizePixel = 0, Text = "", PlaceholderText = "Profile JSON appears here. You can copy it or paste a profile to import.", PlaceholderColor3 = MUTED, TextColor3 = TEXT, TextSize = 11, Font = Enum.Font.Code, TextWrapped = true, TextXAlignment = Enum.TextXAlignment.Left, TextYAlignment = Enum.TextYAlignment.Top, ClearTextOnFocus = false, MultiLine = true }, profiles)
+round(configTextBox, 10)
+make("UIPadding", { PaddingTop = UDim.new(0, 8), PaddingBottom = UDim.new(0, 8), PaddingLeft = UDim.new(0, 8), PaddingRight = UDim.new(0, 8) }, configTextBox)
+actionButton(profiles, "Export current settings", "Generate JSON for movement, visuals, theme, keybind and saved waypoints.", function()
+    local waypointData = {}
+    for _, waypoint in ipairs(savedWaypoints) do
+        table.insert(waypointData, { id = waypoint.id, name = waypoint.name, cframe = { waypoint.cframe:GetComponents() } })
+    end
+    local data = {
+        version = 2,
+        flySpeed = flySpeed,
+        walkSpeed = walkSpeed,
+        jumpPower = jumpPower,
+        fieldOfView = (workspace.CurrentCamera and workspace.CurrentCamera.FieldOfView) or savedCameraFov,
+        fogEnd = Lighting.FogEnd,
+        toggleKey = toggleKeyCode.Name,
+        theme = { math.floor(currentAccent.R * 255), math.floor(currentAccent.G * 255), math.floor(currentAccent.B * 255) },
+        waypoints = waypointData,
+    }
+    configTextBox.Text = HttpService:JSONEncode(data)
+    notify("Profile exported to the text box")
+end)
+actionButton(profiles, "Import settings from JSON", "Paste a profile in the text box, then apply it.", function()
+    local ok, data = pcall(function() return HttpService:JSONDecode(configTextBox.Text) end)
+    if not ok or type(data) ~= "table" then notify("Invalid profile JSON", RED); return end
+    if type(data.flySpeed) == "number" then setFlightSpeedSlider(math.clamp(math.floor(data.flySpeed), 20, 300)) end
+    if type(data.walkSpeed) == "number" then setWalkSpeedSlider(math.clamp(math.floor(data.walkSpeed), 8, 100)) end
+    if type(data.jumpPower) == "number" then setJumpPowerSlider(math.clamp(math.floor(data.jumpPower), 25, 150)) end
+    if type(data.fieldOfView) == "number" then setFovSlider(math.clamp(math.floor(data.fieldOfView), 50, 100)) end
+    if type(data.fogEnd) == "number" then setFogSlider(math.clamp(math.floor(data.fogEnd), 100, 100000)) end
+    if type(data.toggleKey) == "string" then
+        local key = Enum.KeyCode[data.toggleKey]
+        if key and key ~= Enum.KeyCode.Unknown then toggleKeyCode = key end
+    end
+    if type(data.theme) == "table" and type(data.theme[1]) == "number" and type(data.theme[2]) == "number" and type(data.theme[3]) == "number" and applyAccent then
+        applyAccent(Color3.fromRGB(math.clamp(data.theme[1], 0, 255), math.clamp(data.theme[2], 0, 255), math.clamp(data.theme[3], 0, 255)))
+    end
+    if type(data.waypoints) == "table" then
+        table.clear(savedWaypoints)
+        for _, waypoint in ipairs(data.waypoints) do
+            if type(waypoint) == "table" and type(waypoint.name) == "string" and type(waypoint.cframe) == "table" and #waypoint.cframe == 12 then
+                local success, cf = pcall(function() return CFrame.new(table.unpack(waypoint.cframe)) end)
+                if success then
+                    nextWaypointId += 1
+                    table.insert(savedWaypoints, { id = nextWaypointId, name = waypoint.name, cframe = cf })
+                end
+            end
+        end
+        if refreshWaypointList then refreshWaypointList() end
+    end
+    notify("Profile settings applied")
+end)
+
+-- Waypoint manager. The original Gold Farm route runner below remains separate and unchanged.
+section(routes, "Waypoint manager", "Save named positions, rename or delete them, and optionally play a route through your saved points.")
+local waypointNameBox = make("TextBox", { Size = UDim2.new(1, -4, 0, 38), BackgroundColor3 = PANEL, BorderSizePixel = 0, Text = "Waypoint", PlaceholderText = "Waypoint name", PlaceholderColor3 = MUTED, TextColor3 = TEXT, TextSize = 12, Font = Enum.Font.Gotham, ClearTextOnFocus = false }, routes)
+round(waypointNameBox, 9)
+local waypointList = make("Frame", { Size = UDim2.new(1, -4, 0, 8), AutomaticSize = Enum.AutomaticSize.Y, BackgroundTransparency = 1 }, routes)
+make("UIListLayout", { Padding = UDim.new(0, 7), SortOrder = Enum.SortOrder.LayoutOrder }, waypointList)
+refreshWaypointList = function()
+    for _, child in ipairs(waypointList:GetChildren()) do if not child:IsA("UIListLayout") then child:Destroy() end end
+    for index, waypoint in ipairs(savedWaypoints) do
+        local row = make("Frame", { Size = UDim2.new(1, 0, 0, 42), BackgroundColor3 = PANEL, BorderSizePixel = 0, LayoutOrder = index }, waypointList)
+        round(row, 8)
+        local renameBox = make("TextBox", { Size = UDim2.new(0.42, 0, 1, 0), Position = UDim2.fromOffset(8, 0), BackgroundTransparency = 1, Text = waypoint.name, PlaceholderText = "Name", TextColor3 = TEXT, TextSize = 11, Font = Enum.Font.Gotham, ClearTextOnFocus = false, TextXAlignment = Enum.TextXAlignment.Left }, row)
+        renameBox.FocusLost:Connect(function() if renameBox.Text:gsub("%s", "") ~= "" then waypoint.name = renameBox.Text end end)
+        local goButton = make("TextButton", { Size = UDim2.new(0.22, -3, 0, 28), Position = UDim2.new(0.44, 0, 0.5, -14), BackgroundColor3 = ACCENT_DARK, BorderSizePixel = 0, Text = "Go", TextColor3 = TEXT, TextSize = 11, Font = Enum.Font.GothamBold }, row)
+        round(goButton, 7)
+        goButton.MouseButton1Click:Connect(function() teleportToCFrame(waypoint.cframe, waypoint.name) end)
+        local updateButton = make("TextButton", { Size = UDim2.new(0.16, -3, 0, 28), Position = UDim2.new(0.67, 0, 0.5, -14), BackgroundColor3 = PANEL_ALT, BorderSizePixel = 0, Text = "Update", TextColor3 = TEXT, TextSize = 10, Font = Enum.Font.GothamBold }, row)
+        round(updateButton, 7)
+        updateButton.MouseButton1Click:Connect(function() local root = getRoot(); if root then waypoint.cframe = root.CFrame; notify("Waypoint updated: " .. waypoint.name) end end)
+        local deleteButton = make("TextButton", { Size = UDim2.new(0.13, -4, 0, 28), Position = UDim2.new(0.84, 0, 0.5, -14), BackgroundColor3 = Color3.fromRGB(120, 47, 61), BorderSizePixel = 0, Text = "Delete", TextColor3 = TEXT, TextSize = 10, Font = Enum.Font.GothamBold }, row)
+        round(deleteButton, 7)
+        deleteButton.MouseButton1Click:Connect(function()
+            for i, candidate in ipairs(savedWaypoints) do if candidate.id == waypoint.id then table.remove(savedWaypoints, i); break end end
+            refreshWaypointList()
+            notify("Waypoint deleted", MUTED)
+        end)
+    end
+    waypointList.Size = UDim2.new(1, -4, 0, math.max(8, #savedWaypoints * 49))
+end
+actionButton(routes, "Save named waypoint", "Save your current position using the name above.", function()
+    local root = getRoot()
+    if not root then notify("Character not ready", RED); return end
+    nextWaypointId += 1
+    local name = waypointNameBox.Text:gsub("^%s*(.-)%s*$", "%1")
+    if name == "" then name = "Waypoint " .. nextWaypointId end
+    table.insert(savedWaypoints, { id = nextWaypointId, name = name, cframe = root.CFrame })
+    refreshWaypointList()
+    notify("Saved waypoint: " .. name)
+end)
+local routePlaybackButton
+routePlaybackButton = actionButton(routes, "Start saved waypoint route", "Moves through saved waypoints in order. This is separate from Gold Farm.", function()
+    if routePlaybackActive then routePlaybackActive = false; notify("Saved waypoint route stopped", MUTED); routePlaybackButton:FindFirstChildWhichIsA("TextLabel").Text = "Start saved waypoint route"; return end
+    if #savedWaypoints == 0 then notify("Save at least one waypoint first", RED); return end
+    routePlaybackActive = true
+    routePlaybackButton:FindFirstChildWhichIsA("TextLabel").Text = "Stop saved waypoint route"
+    notify("Saved waypoint route started")
+    task.spawn(function()
+        while routePlaybackActive and not destroyed do
+            for _, waypoint in ipairs(savedWaypoints) do
+                if not routePlaybackActive or destroyed then break end
+                local root = getRoot()
+                if root then
+                    local startCFrame, targetCFrame = root.CFrame, waypoint.cframe
+                    local duration = math.max((startCFrame.Position - targetCFrame.Position).Magnitude / 375, 0.05)
+                    local startTime = os.clock()
+                    while routePlaybackActive and not destroyed and os.clock() - startTime < duration do
+                        local currentRoot = getRoot()
+                        if not currentRoot then break end
+                        currentRoot.CFrame = startCFrame:Lerp(targetCFrame, math.clamp((os.clock() - startTime) / duration, 0, 1))
+                        currentRoot.AssemblyLinearVelocity = Vector3.zero
+                        currentRoot.AssemblyAngularVelocity = Vector3.zero
+                        RunService.Heartbeat:Wait()
+                    end
+                    if routePlaybackActive and not destroyed then local finalRoot = getRoot(); if finalRoot then finalRoot.CFrame = targetCFrame end end
+                end
+            end
+            if routePlaybackActive then task.wait(0.25) end
+        end
+    end)
+end, ACCENT)
+
+-- Theme selection: applies an accent color to existing UI elements.
+section(settings, "Appearance & keybinds", "Choose an accent color or set a new menu toggle key.")
+applyAccent = function(color)
+    currentAccent = color
+    for _, object in ipairs(screenGui:GetDescendants()) do
+        if object:IsA("Frame") or object:IsA("TextButton") or object:IsA("ScrollingFrame") then
+            if object.BackgroundColor3 == ACCENT or object.BackgroundColor3 == ACCENT_DARK or object.BackgroundColor3 == Color3.fromRGB(38, 55, 88) then
+                object.BackgroundColor3 = color
+            end
+        end
+        if object:IsA("UIStroke") and object.Color == Color3.fromRGB(59, 72, 103) then object.Color = color end
+        if object.Name == "Indicator" then object.BackgroundColor3 = color end
+        if object:IsA("ScrollingFrame") then object.ScrollBarImageColor3 = color end
+    end
+    ACCENT = color
+    ACCENT_DARK = color:Lerp(Color3.new(0, 0, 0), 0.25)
+    notify("Accent theme updated")
+end
+actionButton(settings, "Blue accent theme", "Apply the default blue accent.", function() applyAccent(Color3.fromRGB(76, 132, 255)) end, Color3.fromRGB(76, 132, 255))
+actionButton(settings, "Purple accent theme", "Apply a purple accent.", function() applyAccent(Color3.fromRGB(171, 106, 255)) end, Color3.fromRGB(171, 106, 255))
+actionButton(settings, "Green accent theme", "Apply a green accent.", function() applyAccent(Color3.fromRGB(55, 205, 135)) end, Color3.fromRGB(55, 205, 135))
+actionButton(settings, "Change menu hotkey", "Click this, then press the key you want to use.", function()
+    awaitingKeybind = true
+    notify("Press a keyboard key to set the menu hotkey", ACCENT)
+end)
+
+-- Command palette: quick shortcuts for common development tasks.
+section(home, "Command palette", "Type a command such as help, save, return, route start, route stop, heal, inspect boat, reset visuals, or fullbright on/off.")
+local commandBox = make("TextBox", { Size = UDim2.new(1, -4, 0, 38), BackgroundColor3 = PANEL, BorderSizePixel = 0, Text = "help", PlaceholderText = "Enter command...", PlaceholderColor3 = MUTED, TextColor3 = TEXT, TextSize = 12, Font = Enum.Font.Code, ClearTextOnFocus = false }, home)
+round(commandBox, 9)
+actionButton(home, "Run command", "Execute a supported toolkit command.", function()
+    local command = string.lower(commandBox.Text:gsub("^%s*(.-)%s*$", "%1"))
+    if command == "help" then
+        notify("Commands: save, return, heal, route start/stop, inspect boat, reset visuals, fullbright on/off")
+    elseif command == "save" then
+        local root = getRoot()
+        if root then waypointCFrame = root.CFrame; notify("Current position saved") else notify("Character not ready", RED) end
+    elseif command == "return" then
+        local root = getRoot()
+        if root and waypointCFrame then root.CFrame = waypointCFrame; notify("Returned to saved position") else notify("Save a position first", RED) end
+    elseif command == "heal" then
+        local humanoid = getHumanoid()
+        if humanoid then humanoid.Health = humanoid.MaxHealth; notify("Health restored") else notify("Character not ready", RED) end
+    elseif command == "route start" then
+        if not isRunning then goldFarmToggle(true) end
+        notify("Gold Farm route requested")
+    elseif command == "route stop" then
+        if isRunning then goldFarmToggle(false) end
+        notify("Gold Farm route stop requested", MUTED)
+    elseif command == "inspect boat" then
+        selectTab("Boat Lab")
+        notify("Open Boat Lab and click Inspect nearest boat")
+    elseif command == "reset visuals" then
+        local camera = workspace.CurrentCamera
+        if camera then camera.FieldOfView = savedCameraFov end
+        Lighting.FogStart = originalFogStartValue
+        Lighting.FogEnd = originalFogEndValue
+        Lighting.FogColor = originalFogColor
+        Lighting.Ambient = originalAmbient
+        Lighting.OutdoorAmbient = originalOutdoorAmbient
+        Lighting.ColorShift_Top = originalColorShiftTop
+        Lighting.ColorShift_Bottom = originalColorShiftBottom
+        if savedLighting then Lighting.Brightness = savedLighting.Brightness; Lighting.ClockTime = savedLighting.ClockTime; Lighting.GlobalShadows = savedLighting.GlobalShadows end
+        fullbrightActive = false
+        notify("Visual settings restored", MUTED)
+    elseif command == "fullbright on" then
+        if setFullbrightToggle then setFullbrightToggle(true) end
+    elseif command == "fullbright off" then
+        if setFullbrightToggle then setFullbrightToggle(false) end
+    else
+        notify("Unknown command. Type help.", RED)
+    end
+end, ACCENT)
+
+-- Window dragging: only the title bar starts a drag.
+local dragging = false
+local dragStart, startPosition
+ topbar.InputBegan:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+        dragging = true
+        dragStart = input.Position
+        startPosition = menu.Position
+    end
+end)
+track(UserInputService.InputChanged:Connect(function(input)
+    if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch) then
+        local delta = input.Position - dragStart
+        menu.Position = UDim2.new(startPosition.X.Scale, startPosition.X.Offset + delta.X, startPosition.Y.Scale, startPosition.Y.Offset + delta.Y)
+    end
+end))
+track(UserInputService.InputEnded:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then dragging = false end
+end))
+
+local expandedSize = menu.Size
+local function setMinimized(state)
+    minimized = state
+    if minimized then
+        expandedSize = menu.Size
+        tween(menu, 0.18, { Size = UDim2.new(expandedSize.X.Scale, expandedSize.X.Offset, 0, 58) })
+        sidebar.Visible = false
+        pageHolder.Visible = false
+        minimizeButton.Text = "+"
+    else
+        sidebar.Visible = true
+        pageHolder.Visible = true
+        tween(menu, 0.18, { Size = expandedSize })
+        minimizeButton.Text = "−"
+    end
+end
+minimizeButton.MouseButton1Click:Connect(function() setMinimized(not minimized) end)
+
+local function cleanup()
+    if destroyed then return end
+    destroyed = true
+    isRunning = false
+    goldFarmRunToken += 1
+    routePlaybackActive = false
+    flyActive = false
+    noclipActive = false
+    regenActive = false
+    if flyVelocity then flyVelocity:Destroy() end
+    if flyOrientation then flyOrientation:Destroy() end
+    if flyAttachment then flyAttachment:Destroy() end
+    for part, canCollide in pairs(originalCollisions) do
+        if part and part.Parent then part.CanCollide = canCollide end
+    end
+    if savedLighting then
+        Lighting.Brightness = savedLighting.Brightness
+        Lighting.ClockTime = savedLighting.ClockTime
+        Lighting.FogEnd = savedLighting.FogEnd
+        Lighting.GlobalShadows = savedLighting.GlobalShadows
+    end
+    Lighting.FogStart = originalFogStartValue
+    Lighting.FogEnd = originalFogEndValue
+    Lighting.FogColor = originalFogColor
+    Lighting.Ambient = originalAmbient
+    Lighting.OutdoorAmbient = originalOutdoorAmbient
+    Lighting.ColorShift_Top = originalColorShiftTop
+    Lighting.ColorShift_Bottom = originalColorShiftBottom
+    local camera = workspace.CurrentCamera
+    if camera then camera.FieldOfView = savedCameraFov end
+    workspace.Gravity = savedGravity
+    for _, connection in ipairs(activeConnections) do
+        pcall(function() connection:Disconnect() end)
+    end
+end
+
+closeButton.MouseButton1Click:Connect(function()
+    cleanup()
+    screenGui:Destroy()
+end)
+
+track(UserInputService.InputBegan:Connect(function(input, processed)
+    if awaitingKeybind and input.UserInputType == Enum.UserInputType.Keyboard then
+        awaitingKeybind = false
+        toggleKeyCode = input.KeyCode
+        notify("Menu hotkey set to " .. input.KeyCode.Name)
+        return
+    end
+    if input.KeyCode == toggleKeyCode and not processed then
+        screenGui.Enabled = not screenGui.Enabled
+        return
+    end
+    if processed then return end
+    if input.UserInputType == Enum.UserInputType.Keyboard then keysDown[input.KeyCode] = true end
+end))
+track(UserInputService.InputEnded:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.Keyboard then keysDown[input.KeyCode] = nil end
+end))
+
+-- Main update loop: collision state, flight, local health regen, and live status.
+track(RunService.Heartbeat:Connect(function(dt)
+    if destroyed then return end
+    local character = getCharacter()
+    local humanoid = getHumanoid(character)
+    local root = getRoot(character)
+
+    if humanoid then
+        if humanoid.WalkSpeed ~= walkSpeed and not flyActive then
+            -- Respect the values configured in this menu when a character respawns.
+            humanoid.WalkSpeed = walkSpeed
+        end
+        if humanoid.UseJumpPower and humanoid.JumpPower ~= jumpPower then humanoid.JumpPower = jumpPower end
+        if regenActive and humanoid.Health > 0 then humanoid.Health = math.min(humanoid.MaxHealth, humanoid.Health + 20 * dt) end
+        healthLabel.Text = string.format("Health: %d / %d", math.floor(humanoid.Health + 0.5), math.floor(humanoid.MaxHealth + 0.5))
+    else
+        healthLabel.Text = "Health: --"
+    end
+
+    if root then
+        local p = root.Position
+        positionLabel.Text = string.format("Position: %d, %d, %d", math.floor(p.X), math.floor(p.Y), math.floor(p.Z))
+    else
+        positionLabel.Text = "Position: character not ready"
+    end
+    local now = os.clock()
+    local elapsed = now - lastFrameTime
+    if elapsed > 0 then fpsValue = math.floor((fpsValue * 0.85) + ((1 / elapsed) * 0.15)) end
+    lastFrameTime = now
+    fpsLabel.Text = "FPS: " .. tostring(fpsValue)
+    local pingText = "unavailable"
+    pcall(function()
+        local network = Stats:FindFirstChild("Network")
+        local serverStats = network and network:FindFirstChild("ServerStatsItem")
+        local dataPing = serverStats and serverStats:FindFirstChild("Data Ping")
+        if dataPing then pingText = dataPing:GetValueString() end
+    end)
+    pingLabel.Text = "Ping: " .. tostring(pingText)
+    if root then
+        velocityLabel.Text = string.format("Velocity: %.1f studs/s", root.AssemblyLinearVelocity.Magnitude)
+    else
+        velocityLabel.Text = "Velocity: --"
+    end
+    if humanoid then
+        stateLabel.Text = "Character state: " .. humanoid:GetState().Name
+    else
+        stateLabel.Text = "Character state: unavailable"
+    end
+    placeLabel.Text = string.format("Place ID: %d  •  Job: %s", game.PlaceId, game.JobId == "" and "Studio/local" or string.sub(game.JobId, 1, 8))
+    if inspectedBoat and inspectedBoat.Parent then
+        local boatRoot = inspectedBoat.PrimaryPart or inspectedBoat:FindFirstChildWhichIsA("BasePart", true)
+        if boatRoot then boatSpeedText.Text = string.format("Boat speed: %.1f studs/s", boatRoot.AssemblyLinearVelocity.Magnitude) end
+    else
+        boatSpeedText.Text = "Boat speed: --"
+    end
+
+    if noclipActive and character then
+        for _, item in ipairs(character:GetDescendants()) do
+            if item:IsA("BasePart") then
+                if originalCollisions[item] == nil then originalCollisions[item] = item.CanCollide end
+                item.CanCollide = false
+            end
+        end
+    end
+
+    if flyActive and root then
+        if not flyAttachment or flyAttachment.Parent ~= root then
+            if flyVelocity then flyVelocity:Destroy() end
+            if flyOrientation then flyOrientation:Destroy() end
+            if flyAttachment then flyAttachment:Destroy() end
+            flyAttachment = Instance.new("Attachment")
+            flyAttachment.Name = "AutoFarmFlyAttachment"
+            flyAttachment.Parent = root
+            flyVelocity = Instance.new("LinearVelocity")
+            flyVelocity.Name = "AutoFarmFlyVelocity"
+            flyVelocity.Attachment0 = flyAttachment
+            flyVelocity.RelativeTo = Enum.ActuatorRelativeTo.World
+            flyVelocity.VectorVelocity = Vector3.zero
+            flyVelocity.MaxForce = math.huge
+            flyVelocity.Parent = root
+            flyOrientation = Instance.new("AlignOrientation")
+            flyOrientation.Name = "AutoFarmFlyOrientation"
+            flyOrientation.Attachment0 = flyAttachment
+            flyOrientation.Mode = Enum.OrientationAlignmentMode.OneAttachment
+            flyOrientation.Responsiveness = 18
+            flyOrientation.MaxTorque = math.huge
+            flyOrientation.Parent = root
+        end
+        local camera = workspace.CurrentCamera
+        if camera then
+            flyOrientation.CFrame = camera.CFrame.Rotation
+            local direction = Vector3.zero
+            if keysDown[Enum.KeyCode.W] then direction += camera.CFrame.LookVector end
+            if keysDown[Enum.KeyCode.S] then direction -= camera.CFrame.LookVector end
+            if keysDown[Enum.KeyCode.A] then direction -= camera.CFrame.RightVector end
+            if keysDown[Enum.KeyCode.D] then direction += camera.CFrame.RightVector end
+            if keysDown[Enum.KeyCode.Space] then direction += Vector3.yAxis end
+            if keysDown[Enum.KeyCode.LeftShift] or keysDown[Enum.KeyCode.RightShift] then direction -= Vector3.yAxis end
+            if direction.Magnitude > 0 then direction = direction.Unit * flySpeed end
+            flyVelocity.VectorVelocity = direction
+        end
+    elseif flyVelocity or flyOrientation or flyAttachment then
+        if flyVelocity then flyVelocity:Destroy(); flyVelocity = nil end
+        if flyOrientation then flyOrientation:Destroy(); flyOrientation = nil end
+        if flyAttachment then flyAttachment:Destroy(); flyAttachment = nil end
+    end
+end))
+
+track(player.CharacterAdded:Connect(function(character)
+    task.wait(0.25)
+    local humanoid = getHumanoid(character)
+    if humanoid then
+        humanoid.WalkSpeed = walkSpeed
+        humanoid.UseJumpPower = true
+        humanoid.JumpPower = jumpPower
+    end
+end))
+
+selectTab("Home")
+notify("Ready  •  K toggles menu")
